@@ -276,7 +276,7 @@ This plugin adjusts the bottom margin temporarily when the keyboard pops up to k
 
 UnityWebViewPostprocessBuild.cs will select one of WebViewPlugin-*.aar.tmpl depending on EditorUserSettings.development. You can build these files as below:
 
-1. Install Unity 2019.4.40f1 with Android Build Support by Unity Hub.
+1. Install Unity 2019.4.41f2 with Android Build Support by Unity Hub.
    * Also install Unity 5.6.1f1 from https://unity.com/ja/releases/editor/whats-new/5.6.1 and specify `--zorderpatch` if you need to include CUnityPlayer and CUnityPlayerActivity (cf. https://github.com/gree/unity-webview/pull/155 ).
 2. Open Terminal (mac) or Git Bash (windows), `cd plugins/Android`, and invoke `./install.sh`.
 
