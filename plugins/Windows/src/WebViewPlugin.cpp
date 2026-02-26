@@ -11,6 +11,7 @@
 #include <memory>
 #include <regex>
 #include <wrl.h>
+#include <dcomp.h>
 #include <WebView2.h>
 
 using Microsoft::WRL::ComPtr;
@@ -29,6 +30,14 @@ enum {
     WM_WEBVIEW_SETRECT,
     WM_WEBVIEW_DESTROY,
     WM_WEBVIEW_CAPTURE,
+    WM_WEBVIEW_MOUSEEVENT,
+};
+
+struct MouseEventData {
+    int x;
+    int y;
+    float deltaY;
+    int mouseState;
 };
 
 class WebViewInstance;
@@ -68,8 +77,13 @@ class WebViewInstance {
 
     ComPtr<ICoreWebView2Environment> m_environment;
     ComPtr<ICoreWebView2Controller> m_controller;
+    ComPtr<ICoreWebView2CompositionController> m_compositionController;
     ComPtr<ICoreWebView2> m_webview;
     ComPtr<ICoreWebView2CookieManager> m_cookieManager;
+
+    ComPtr<IDCompositionDevice> m_dcompDevice;
+    ComPtr<IDCompositionTarget> m_dcompTarget;
+    ComPtr<IDCompositionVisual> m_dcompVisual;
 
     HWND m_hwnd = nullptr;
     HWND m_browserHwnd = nullptr;
@@ -241,33 +255,39 @@ public:
 
     void sendMouseEvent(int x, int y, float deltaY, int mouseState) {
         if (!m_hwnd || !m_controller) return;
-        HWND target = getBrowserHwnd();
-        // Unity y-coordinate has origin at bottom-left; flip to top-left for Win32
-        int wy = m_height - y;
-        LPARAM lParam = MAKELPARAM(x, wy);
 
-        switch (mouseState) {
-        case 1: // mouse down
-            PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lParam);
-            break;
-        case 2: // mouse drag
-            PostMessageW(target, WM_MOUSEMOVE, MK_LBUTTON, lParam);
-            break;
-        case 3: // mouse up
-            PostMessageW(target, WM_LBUTTONUP, 0, lParam);
-            break;
-        default: // mouse move (no button)
-            PostMessageW(target, WM_MOUSEMOVE, 0, lParam);
-            break;
-        }
-        if (deltaY != 0.0f) {
-            // Use JavaScript scrolling with smooth behavior for offscreen WebView2
-            int scrollAmount = static_cast<int>(deltaY * -120);
-            char js[256];
-            snprintf(js, sizeof(js),
-                "window.scrollBy({top:%d,behavior:'smooth'})", scrollAmount);
-            auto* copy = _strdup(js);
-            PostThreadMessageW(m_threadId, WM_WEBVIEW_EVALUATEJS, 0, reinterpret_cast<LPARAM>(copy));
+        if (m_compositionController) {
+            // Marshal to WebView2 thread — SendMouseInput is a COM call
+            auto* data = new MouseEventData{x, y, deltaY, mouseState};
+            PostThreadMessageW(m_threadId, WM_WEBVIEW_MOUSEEVENT, 0, reinterpret_cast<LPARAM>(data));
+        } else {
+            // Separated/fallback: post Win32 messages to browser HWND
+            int wy = m_height - y;
+            HWND target = getBrowserHwnd();
+            LPARAM lParam = MAKELPARAM(x, wy);
+
+            switch (mouseState) {
+            case 1: // mouse down
+                PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lParam);
+                break;
+            case 2: // mouse drag
+                PostMessageW(target, WM_MOUSEMOVE, MK_LBUTTON, lParam);
+                break;
+            case 3: // mouse up
+                PostMessageW(target, WM_LBUTTONUP, 0, lParam);
+                break;
+            default: // mouse move (no button)
+                PostMessageW(target, WM_MOUSEMOVE, 0, lParam);
+                break;
+            }
+            if (deltaY != 0.0f) {
+                int scrollAmount = static_cast<int>(deltaY * -120);
+                char js[256];
+                snprintf(js, sizeof(js),
+                    "window.scrollBy({top:%d,behavior:'smooth'})", scrollAmount);
+                auto* copy = _strdup(js);
+                PostThreadMessageW(m_threadId, WM_WEBVIEW_EVALUATEJS, 0, reinterpret_cast<LPARAM>(copy));
+            }
         }
     }
 
@@ -532,6 +552,9 @@ private:
         if (m_separated) {
             ShowWindow(m_hwnd, SW_SHOW);
             UpdateWindow(m_hwnd);
+        } else {
+            // Must show for DComp visual tree to be active (window is off-screen)
+            ShowWindow(m_hwnd, SW_SHOWNA);
         }
 
         SetEvent(m_readyEvent);
@@ -551,6 +574,10 @@ private:
             DispatchMessageW(&msg);
         }
 
+        m_compositionController = nullptr;
+        m_dcompVisual = nullptr;
+        m_dcompTarget = nullptr;
+        m_dcompDevice = nullptr;
         if (m_controller) {
             m_controller->Close();
             m_controller = nullptr;
@@ -652,6 +679,45 @@ private:
                     }).Get());
             break;
         }
+        case WM_WEBVIEW_MOUSEEVENT: {
+            auto* data = reinterpret_cast<MouseEventData*>(msg.lParam);
+            if (data && m_compositionController) {
+                int wy = m_height - data->y;
+                POINT point = {data->x, wy};
+                COREWEBVIEW2_MOUSE_EVENT_KIND kind;
+                COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS vkeys = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE;
+                UINT32 mouseData = 0;
+
+                switch (data->mouseState) {
+                case 1: // mouse down
+                    kind = COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_DOWN;
+                    vkeys = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON;
+                    break;
+                case 2: // mouse drag
+                    kind = COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE;
+                    vkeys = COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_LEFT_BUTTON;
+                    break;
+                case 3: // mouse up
+                    kind = COREWEBVIEW2_MOUSE_EVENT_KIND_LEFT_BUTTON_UP;
+                    break;
+                default: // mouse move (no button)
+                    kind = COREWEBVIEW2_MOUSE_EVENT_KIND_MOVE;
+                    break;
+                }
+                m_compositionController->SendMouseInput(kind, vkeys, mouseData, point);
+
+                if (data->deltaY != 0.0f) {
+                    POINT wheelPoint = {data->x, wy};
+                    mouseData = static_cast<UINT32>(static_cast<int>(data->deltaY * WHEEL_DELTA));
+                    m_compositionController->SendMouseInput(
+                        COREWEBVIEW2_MOUSE_EVENT_KIND_WHEEL,
+                        COREWEBVIEW2_MOUSE_EVENT_VIRTUAL_KEYS_NONE,
+                        mouseData, wheelPoint);
+                }
+            }
+            delete data;
+            break;
+        }
         }
     }
 
@@ -667,23 +733,91 @@ private:
                         return S_OK;
                     }
                     m_environment = env;
-                    env->CreateCoreWebView2Controller(
-                        m_hwnd,
-                        Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
-                            [this](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
-                                if (FAILED(result) || !controller) {
-                                    addMessage("CallOnError:Failed to create WebView2 controller");
-                                    return S_OK;
-                                }
-                                onWebView2Created(controller);
-                                return S_OK;
-                            }).Get());
+
+                    if (!m_separated) {
+                        // Offscreen: try CompositionController for native input
+                        ComPtr<ICoreWebView2Environment3> env3;
+                        if (SUCCEEDED(env->QueryInterface(IID_PPV_ARGS(&env3))) && env3) {
+                            env3->CreateCoreWebView2CompositionController(
+                                m_hwnd,
+                                Callback<ICoreWebView2CreateCoreWebView2CompositionControllerCompletedHandler>(
+                                    [this](HRESULT result, ICoreWebView2CompositionController* compositionController) -> HRESULT {
+                                        if (FAILED(result) || !compositionController) {
+                                            // Fallback to regular controller
+                                            createRegularController();
+                                            return S_OK;
+                                        }
+                                        onCompositionControllerCreated(compositionController);
+                                        return S_OK;
+                                    }).Get());
+                            return S_OK;
+                        }
+                    }
+
+                    // Separated mode or env3 QI failed: use regular controller
+                    createRegularController();
                     return S_OK;
                 }).Get());
 
         if (FAILED(hr)) {
             addMessage("CallOnError:WebView2 runtime not found");
         }
+    }
+
+    void createRegularController() {
+        m_environment->CreateCoreWebView2Controller(
+            m_hwnd,
+            Callback<ICoreWebView2CreateCoreWebView2ControllerCompletedHandler>(
+                [this](HRESULT result, ICoreWebView2Controller* controller) -> HRESULT {
+                    if (FAILED(result) || !controller) {
+                        addMessage("CallOnError:Failed to create WebView2 controller");
+                        return S_OK;
+                    }
+                    onWebView2Created(controller);
+                    return S_OK;
+                }).Get());
+    }
+
+    void onCompositionControllerCreated(ICoreWebView2CompositionController* compositionController) {
+        m_compositionController = compositionController;
+
+        // The composition controller implements ICoreWebView2Controller
+        ComPtr<ICoreWebView2Controller> controller;
+        HRESULT hr = compositionController->QueryInterface(IID_PPV_ARGS(&controller));
+        if (FAILED(hr) || !controller) {
+            // Cannot use composition path, fall back
+            m_compositionController = nullptr;
+            createRegularController();
+            return;
+        }
+
+        if (!initDirectComposition()) {
+            // DComp setup failed, fall back to regular controller
+            m_compositionController = nullptr;
+            m_dcompVisual = nullptr;
+            m_dcompTarget = nullptr;
+            m_dcompDevice = nullptr;
+            createRegularController();
+            return;
+        }
+
+        onWebView2Created(controller.Get());
+    }
+
+    bool initDirectComposition() {
+        HRESULT hr = DCompositionCreateDevice(nullptr, IID_PPV_ARGS(&m_dcompDevice));
+        if (FAILED(hr)) return false;
+
+        hr = m_dcompDevice->CreateTargetForHwnd(m_hwnd, TRUE, &m_dcompTarget);
+        if (FAILED(hr)) return false;
+
+        hr = m_dcompDevice->CreateVisual(&m_dcompVisual);
+        if (FAILED(hr)) return false;
+
+        m_dcompTarget->SetRoot(m_dcompVisual.Get());
+        m_compositionController->put_RootVisualTarget(m_dcompVisual.Get());
+        m_dcompDevice->Commit();
+        return true;
     }
 
     void onWebView2Created(ICoreWebView2Controller* controller) {
@@ -734,7 +868,8 @@ private:
         }
 
         // Inject Unity.call JS bridge
-        std::wstring bridgeScript = L"window.Unity = { call: function(msg) { window.chrome.webview.postMessage(msg); } };";
+        std::wstring bridgeScript =
+            L"window.Unity = { call: function(msg) { window.chrome.webview.postMessage(msg); } };";
         m_webview->AddScriptToExecuteOnDocumentCreated(
             bridgeScript.c_str(),
             Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
