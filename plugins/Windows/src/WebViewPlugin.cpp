@@ -68,6 +68,7 @@ class WebViewInstance {
     ComPtr<ICoreWebView2Environment> m_environment;
     ComPtr<ICoreWebView2Controller> m_controller;
     ComPtr<ICoreWebView2> m_webview;
+    ComPtr<ICoreWebView2CookieManager> m_cookieManager;
 
     HWND m_hwnd = nullptr;
 
@@ -306,7 +307,6 @@ public:
                m_bitmapWidth * m_bitmapHeight * 4);
     }
 
-    // Stubs for Task 8
     void addCustomHeader(const char* key, const char* value) {
         if (!key || !value) return;
         std::lock_guard<std::mutex> lock(m_headerMutex);
@@ -334,7 +334,85 @@ public:
         m_customHeaders.clear();
     }
 
-    void getCookies(const char* url) {}
+    void getCookies(const char* url) {
+        if (!m_cookieManager || !url) return;
+        std::wstring wurl = Utf8ToWide(url);
+        m_cookieManager->GetCookies(
+            wurl.c_str(),
+            Callback<ICoreWebView2GetCookiesCompletedHandler>(
+                [this](HRESULT result, ICoreWebView2CookieList* cookieList) -> HRESULT {
+                    if (FAILED(result) || !cookieList) return S_OK;
+
+                    UINT count = 0;
+                    cookieList->get_Count(&count);
+
+                    std::string cookieStr;
+                    for (UINT i = 0; i < count; i++) {
+                        ComPtr<ICoreWebView2Cookie> cookie;
+                        cookieList->GetValueAtIndex(i, &cookie);
+                        if (!cookie) continue;
+
+                        LPWSTR name = nullptr, value = nullptr, domain = nullptr, path = nullptr;
+                        cookie->get_Name(&name);
+                        cookie->get_Value(&value);
+                        cookie->get_Domain(&domain);
+                        cookie->get_Path(&path);
+
+                        if (name && value) {
+                            cookieStr += WideToUtf8(name) + "=" + WideToUtf8(value);
+                            if (domain) {
+                                cookieStr += "; Domain=" + WideToUtf8(domain);
+                            }
+                            if (path) {
+                                cookieStr += "; Path=" + WideToUtf8(path);
+                            }
+                            cookieStr += "; Version=0\n";
+                        }
+
+                        CoTaskMemFree(name);
+                        CoTaskMemFree(value);
+                        CoTaskMemFree(domain);
+                        CoTaskMemFree(path);
+                    }
+
+                    addMessage("CallOnCookies:" + cookieStr);
+                    return S_OK;
+                }).Get());
+    }
+
+    bool hasCookieManager() { return m_cookieManager != nullptr; }
+
+    void clearAllCookies() {
+        if (m_cookieManager) {
+            m_cookieManager->DeleteAllCookies();
+        }
+    }
+
+    void clearCookie(const char* url, const char* name) {
+        if (!m_cookieManager || !url || !name) return;
+        std::wstring wurl = Utf8ToWide(url);
+        std::wstring wname = Utf8ToWide(name);
+        m_cookieManager->GetCookies(
+            wurl.c_str(),
+            Callback<ICoreWebView2GetCookiesCompletedHandler>(
+                [this, wname](HRESULT result, ICoreWebView2CookieList* cookieList) -> HRESULT {
+                    if (FAILED(result) || !cookieList) return S_OK;
+                    UINT count = 0;
+                    cookieList->get_Count(&count);
+                    for (UINT i = 0; i < count; i++) {
+                        ComPtr<ICoreWebView2Cookie> cookie;
+                        cookieList->GetValueAtIndex(i, &cookie);
+                        if (!cookie) continue;
+                        LPWSTR cookieName = nullptr;
+                        cookie->get_Name(&cookieName);
+                        if (cookieName && wname == cookieName) {
+                            m_cookieManager->DeleteCookie(cookie.Get());
+                        }
+                        CoTaskMemFree(cookieName);
+                    }
+                    return S_OK;
+                }).Get());
+    }
 
 private:
     void decodePngFromStream(IStream* stream, std::vector<uint8_t>& buffer, int& width, int& height) {
@@ -588,6 +666,12 @@ private:
             return;
         }
 
+        // Obtain cookie manager from ICoreWebView2_2
+        ComPtr<ICoreWebView2_2> webview2;
+        if (SUCCEEDED(m_webview.As(&webview2)) && webview2) {
+            webview2->get_CookieManager(&m_cookieManager);
+        }
+
         RECT rc;
         GetClientRect(m_hwnd, &rc);
         controller->put_Bounds(rc);
@@ -735,6 +819,28 @@ private:
                         COREWEBVIEW2_WEB_ERROR_STATUS status;
                         args->get_WebErrorStatus(&status);
                         addMessage("CallOnError:" + url + " (error: " + std::to_string(static_cast<int>(status)) + ")");
+                    }
+                    return S_OK;
+                }).Get(), &token);
+
+        // Apply custom headers to all requests
+        m_webview->AddWebResourceRequestedFilter(L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+        m_webview->add_WebResourceRequested(
+            Callback<ICoreWebView2WebResourceRequestedEventHandler>(
+                [this](ICoreWebView2* sender, ICoreWebView2WebResourceRequestedEventArgs* args) -> HRESULT {
+                    ComPtr<ICoreWebView2WebResourceRequest> request;
+                    args->get_Request(&request);
+                    if (!request) return S_OK;
+
+                    ComPtr<ICoreWebView2HttpRequestHeaders> headers;
+                    request->get_Headers(&headers);
+                    if (!headers) return S_OK;
+
+                    std::lock_guard<std::mutex> lock(m_headerMutex);
+                    for (const auto& pair : m_customHeaders) {
+                        std::wstring key = Utf8ToWide(pair.first.c_str());
+                        std::wstring value = Utf8ToWide(pair.second.c_str());
+                        headers->SetHeader(key.c_str(), value.c_str());
                     }
                     return S_OK;
                 }).Get(), &token);
@@ -904,9 +1010,27 @@ EXPORT void _CWebViewPlugin_ClearCustomHeader(void* instance) {
     static_cast<WebViewInstance*>(instance)->clearCustomHeader();
 }
 
-EXPORT void _CWebViewPlugin_ClearCookie(const char* url, const char* name) {}
-EXPORT void _CWebViewPlugin_ClearCookies() {}
-EXPORT void _CWebViewPlugin_SaveCookies() {}
+EXPORT void _CWebViewPlugin_ClearCookie(const char* url, const char* name) {
+    for (auto* inst : s_instances) {
+        if (inst && inst->hasCookieManager()) {
+            inst->clearCookie(url, name);
+            break;
+        }
+    }
+}
+
+EXPORT void _CWebViewPlugin_ClearCookies() {
+    for (auto* inst : s_instances) {
+        if (inst && inst->hasCookieManager()) {
+            inst->clearAllCookies();
+            break;
+        }
+    }
+}
+
+EXPORT void _CWebViewPlugin_SaveCookies() {
+    // WebView2 auto-persists cookies, nothing to do
+}
 
 EXPORT void _CWebViewPlugin_GetCookies(void* instance, const char* url) {
     if (!instance) return;
