@@ -1,0 +1,7 @@
+build/
+packages/
+*.nupkg
+*.dll
+*.lib
+*.exp
+*.pdb
