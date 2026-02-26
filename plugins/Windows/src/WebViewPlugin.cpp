@@ -8,6 +8,7 @@
 #include <vector>
 #include <map>
 #include <atomic>
+#include <memory>
 #include <regex>
 #include <wrl.h>
 #include <WebView2.h>
@@ -89,12 +90,9 @@ class WebViewInstance {
     std::map<std::string, std::string> m_customHeaders;
     std::mutex m_headerMutex;
 
-    std::wstring m_allowPattern;
-    std::wstring m_denyPattern;
-    std::wstring m_hookPattern;
-    bool m_hasAllowPattern = false;
-    bool m_hasDenyPattern = false;
-    bool m_hasHookPattern = false;
+    std::unique_ptr<std::wregex> m_allowRegex;
+    std::unique_ptr<std::wregex> m_denyRegex;
+    std::unique_ptr<std::wregex> m_hookRegex;
     std::mutex m_patternMutex;
 
     // Bitmap placeholders for Task 6
@@ -103,12 +101,13 @@ class WebViewInstance {
     int m_bitmapWidth = 0;
     int m_bitmapHeight = 0;
     bool m_needsDisplay = false;
-    bool m_inRendering = false;
+    std::atomic<bool> m_inRendering{false};
     std::mutex m_bitmapMutex;
 
-    // State for canGoBack/canGoForward
+    // State for canGoBack/canGoForward/progress
     std::atomic<bool> m_canGoBack{false};
     std::atomic<bool> m_canGoForward{false};
+    std::atomic<int> m_progress{0};
 
 public:
     WebViewInstance(const char* gameObject, bool transparent, bool zoom,
@@ -149,10 +148,12 @@ public:
     const char* getMessage() {
         std::lock_guard<std::mutex> lock(m_messageMutex);
         if (m_messages.empty()) return nullptr;
-        static thread_local std::string s_lastMessage;
-        s_lastMessage = m_messages.front();
+        std::string msg = m_messages.front();
         m_messages.pop();
-        return s_lastMessage.c_str();
+        size_t len = msg.size() + 1;
+        char* r = (char*)CoTaskMemAlloc(len);
+        memcpy(r, msg.c_str(), len);
+        return r;
     }
 
     void loadURL(const char* url) {
@@ -200,28 +201,19 @@ public:
         std::lock_guard<std::mutex> lock(m_patternMutex);
         try {
             if (allow && *allow) {
-                m_allowPattern = Utf8ToWide(allow);
-                std::wregex test(m_allowPattern);
-                m_hasAllowPattern = true;
+                m_allowRegex = std::make_unique<std::wregex>(Utf8ToWide(allow));
             } else {
-                m_hasAllowPattern = false;
-                m_allowPattern.clear();
+                m_allowRegex.reset();
             }
             if (deny && *deny) {
-                m_denyPattern = Utf8ToWide(deny);
-                std::wregex test(m_denyPattern);
-                m_hasDenyPattern = true;
+                m_denyRegex = std::make_unique<std::wregex>(Utf8ToWide(deny));
             } else {
-                m_hasDenyPattern = false;
-                m_denyPattern.clear();
+                m_denyRegex.reset();
             }
             if (hook && *hook) {
-                m_hookPattern = Utf8ToWide(hook);
-                std::wregex test(m_hookPattern);
-                m_hasHookPattern = true;
+                m_hookRegex = std::make_unique<std::wregex>(Utf8ToWide(hook));
             } else {
-                m_hasHookPattern = false;
-                m_hookPattern.clear();
+                m_hookRegex.reset();
             }
             return true;
         } catch (...) {
@@ -229,7 +221,7 @@ public:
         }
     }
 
-    int progress() { return 0; }
+    int progress() { return m_progress.load(); }
     bool canGoBack() { return m_canGoBack.load(); }
     bool canGoForward() { return m_canGoForward.load(); }
 
@@ -324,9 +316,11 @@ public:
         std::lock_guard<std::mutex> lock(m_headerMutex);
         auto it = m_customHeaders.find(key);
         if (it == m_customHeaders.end()) return nullptr;
-        static thread_local std::string s_headerValue;
-        s_headerValue = it->second;
-        return s_headerValue.c_str();
+        const std::string& val = it->second;
+        size_t len = val.size() + 1;
+        char* r = (char*)CoTaskMemAlloc(len);
+        memcpy(r, val.c_str(), len);
+        return r;
     }
 
     void clearCustomHeader() {
@@ -676,6 +670,15 @@ private:
         GetClientRect(m_hwnd, &rc);
         controller->put_Bounds(rc);
 
+        // Set transparent background if requested
+        if (m_transparent) {
+            ComPtr<ICoreWebView2Controller2> controller2;
+            if (SUCCEEDED(controller->QueryInterface(IID_PPV_ARGS(&controller2))) && controller2) {
+                COREWEBVIEW2_COLOR bgColor = {0, 0, 0, 0};
+                controller2->put_DefaultBackgroundColor(bgColor);
+            }
+        }
+
         ComPtr<ICoreWebView2Settings> settings;
         m_webview->get_Settings(&settings);
         if (settings) {
@@ -732,6 +735,8 @@ private:
                     std::string url = WideToUtf8(uriRaw);
                     CoTaskMemFree(uriRaw);
 
+                    m_progress.store(10);
+
                     // Check "unity:" scheme
                     if (wurl.find(L"unity:") == 0) {
                         std::string rest = url.substr(6);
@@ -743,10 +748,9 @@ private:
                     std::lock_guard<std::mutex> lock(m_patternMutex);
 
                     // Check hook pattern
-                    if (m_hasHookPattern) {
+                    if (m_hookRegex) {
                         try {
-                            std::wregex hookRegex(m_hookPattern);
-                            if (std::regex_search(wurl, hookRegex)) {
+                            if (std::regex_search(wurl, *m_hookRegex)) {
                                 addMessage("CallOnHooked:" + url);
                                 args->put_Cancel(TRUE);
                                 return S_OK;
@@ -756,26 +760,12 @@ private:
 
                     // Check allow/deny patterns
                     bool pass = true;
-                    if (m_hasAllowPattern) {
+                    if (m_denyRegex) {
                         try {
-                            std::wregex allowRegex(m_allowPattern);
-                            if (std::regex_search(wurl, allowRegex)) {
-                                pass = true;
-                            }
-                        } catch (...) {}
-                    }
-                    if (pass && m_hasDenyPattern) {
-                        try {
-                            std::wregex denyRegex(m_denyPattern);
-                            if (std::regex_search(wurl, denyRegex)) {
-                                // Deny matched, check if allow also matches
-                                if (m_hasAllowPattern) {
-                                    try {
-                                        std::wregex allowRegex(m_allowPattern);
-                                        if (!std::regex_search(wurl, allowRegex)) {
-                                            pass = false;
-                                        }
-                                    } catch (...) {
+                            if (std::regex_search(wurl, *m_denyRegex)) {
+                                // Deny matched, check if allow overrides
+                                if (m_allowRegex) {
+                                    if (!std::regex_search(wurl, *m_allowRegex)) {
                                         pass = false;
                                     }
                                 } else {
@@ -800,6 +790,7 @@ private:
                 [this](ICoreWebView2* sender, ICoreWebView2NavigationCompletedEventArgs* args) -> HRESULT {
                     BOOL isSuccess = FALSE;
                     args->get_IsSuccess(&isSuccess);
+                    m_progress.store(100);
 
                     // Update navigation state
                     BOOL canGoBack = FALSE, canGoForward = FALSE;
@@ -844,6 +835,25 @@ private:
                     }
                     return S_OK;
                 }).Get(), &token);
+
+        // WebResourceResponseReceived handler for HTTP error codes
+        ComPtr<ICoreWebView2_2> webview2ForResponse;
+        if (SUCCEEDED(m_webview.As(&webview2ForResponse)) && webview2ForResponse) {
+            webview2ForResponse->add_WebResourceResponseReceived(
+                Callback<ICoreWebView2WebResourceResponseReceivedEventHandler>(
+                    [this](ICoreWebView2* sender, ICoreWebView2WebResourceResponseReceivedEventArgs* args) -> HRESULT {
+                        ComPtr<ICoreWebView2WebResourceResponseView> response;
+                        args->get_Response(&response);
+                        if (!response) return S_OK;
+
+                        int statusCode = 0;
+                        response->get_StatusCode(&statusCode);
+                        if (statusCode >= 400) {
+                            addMessage("CallOnHttpError:" + std::to_string(statusCode));
+                        }
+                        return S_OK;
+                    }).Get(), &token);
+        }
 
         m_initialized.store(true);
     }
