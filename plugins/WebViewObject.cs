@@ -27,7 +27,7 @@ using System.Runtime.InteropServices;
 #if UNITY_2018_4_OR_NEWER
 using UnityEngine.Networking;
 #endif
-#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
 using System.IO;
 using System.Text.RegularExpressions;
 using UnityEngine.EventSystems;
@@ -40,7 +40,7 @@ using UnityEngine.Android;
 
 using Callback = System.Action<string>;
 
-#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
 public class UnitySendMessageDispatcher
 {
     public static void Dispatch(string name, string method, string message)
@@ -75,7 +75,7 @@ public class WebViewObject : MonoBehaviour
     float mMarginRightComputed;
     float mMarginBottomComputed;
     bool mMarginRelativeComputed;
-#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX || UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
     public GameObject canvas;
     Image bg;
     IntPtr webView;
@@ -510,6 +510,84 @@ public class WebViewObject : MonoBehaviour
     [DllImport("WebView")]
     private static extern void _CWebViewPlugin_GetCookies(IntPtr instance, string url);
     [DllImport("WebView")]
+    private static extern string _CWebViewPlugin_GetMessage(IntPtr instance);
+#elif UNITY_EDITOR_WIN || UNITY_STANDALONE_WIN
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_InitStatic(
+        bool inEditor, bool useMetal);
+    [DllImport("WebViewPlugin")]
+    private static extern bool _CWebViewPlugin_IsInitialized(
+        IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern IntPtr _CWebViewPlugin_Init(
+        string gameObject, bool transparent, bool zoom, int width, int height, string ua, bool separated);
+    [DllImport("WebViewPlugin")]
+    private static extern int _CWebViewPlugin_Destroy(IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_SetRect(
+        IntPtr instance, int width, int height);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_SetVisibility(
+        IntPtr instance, bool visibility);
+    [DllImport("WebViewPlugin")]
+    private static extern bool _CWebViewPlugin_SetURLPattern(
+        IntPtr instance, string allowPattern, string denyPattern, string hookPattern);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_LoadURL(
+        IntPtr instance, string url);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_LoadHTML(
+        IntPtr instance, string html, string baseUrl);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_EvaluateJS(
+        IntPtr instance, string url);
+    [DllImport("WebViewPlugin")]
+    private static extern int _CWebViewPlugin_Progress(
+        IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern bool _CWebViewPlugin_CanGoBack(
+        IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern bool _CWebViewPlugin_CanGoForward(
+        IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_GoBack(
+        IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_GoForward(
+        IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_Reload(
+        IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_SendMouseEvent(IntPtr instance, int x, int y, float deltaY, int mouseState);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_SendKeyEvent(IntPtr instance, int x, int y, string keyChars, ushort keyCode, int keyState);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_Update(IntPtr instance, bool refreshBitmap, int devicePixelRatio);
+    [DllImport("WebViewPlugin")]
+    private static extern int _CWebViewPlugin_BitmapWidth(IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern int _CWebViewPlugin_BitmapHeight(IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_Render(IntPtr instance, IntPtr textureBuffer);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_AddCustomHeader(IntPtr instance, string headerKey, string headerValue);
+    [DllImport("WebViewPlugin")]
+    private static extern string _CWebViewPlugin_GetCustomHeaderValue(IntPtr instance, string headerKey);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_RemoveCustomHeader(IntPtr instance, string headerKey);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_ClearCustomHeader(IntPtr instance);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_ClearCookie(string url, string name);
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_ClearCookies();
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_SaveCookies();
+    [DllImport("WebViewPlugin")]
+    private static extern void _CWebViewPlugin_GetCookies(IntPtr instance, string url);
+    [DllImport("WebViewPlugin")]
     private static extern string _CWebViewPlugin_GetMessage(IntPtr instance);
 #elif UNITY_IPHONE
     [DllImport("__Internal")]
