@@ -232,9 +232,53 @@ public:
     bool canGoBack() { return m_canGoBack.load(); }
     bool canGoForward() { return m_canGoForward.load(); }
 
-    // Stubs for Task 7
-    void sendMouseEvent(int x, int y, float deltaY, int mouseState) {}
-    void sendKeyEvent(int x, int y, char* keyChars, unsigned short keyCode, int keyState) {}
+    void sendMouseEvent(int x, int y, float deltaY, int mouseState) {
+        if (!m_hwnd || !m_controller) return;
+        // Unity y-coordinate has origin at bottom-left; flip to top-left for Win32
+        int wy = m_height - y;
+        LPARAM lParam = MAKELPARAM(x, wy);
+
+        switch (mouseState) {
+        case 1: // mouse down
+            PostMessageW(m_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lParam);
+            break;
+        case 2: // mouse drag
+            PostMessageW(m_hwnd, WM_MOUSEMOVE, MK_LBUTTON, lParam);
+            break;
+        case 3: // mouse up
+            PostMessageW(m_hwnd, WM_LBUTTONUP, 0, lParam);
+            break;
+        default: // mouse move (no button)
+            PostMessageW(m_hwnd, WM_MOUSEMOVE, 0, lParam);
+            break;
+        }
+        if (deltaY != 0.0f) {
+            PostMessageW(m_hwnd, WM_MOUSEWHEEL,
+                MAKEWPARAM(0, static_cast<short>(deltaY * WHEEL_DELTA)),
+                lParam);
+        }
+    }
+
+    void sendKeyEvent(int x, int y, char* keyChars, unsigned short keyCode, int keyState) {
+        if (!m_hwnd) return;
+        switch (keyState) {
+        case 1: // key down
+            PostMessageW(m_hwnd, WM_KEYDOWN, keyCode, 0);
+            if (keyChars && keyChars[0]) {
+                PostMessageW(m_hwnd, WM_CHAR, static_cast<WPARAM>(keyChars[0]), 0);
+            }
+            break;
+        case 2: // key repeat
+            PostMessageW(m_hwnd, WM_KEYDOWN, keyCode, 1 << 30);
+            if (keyChars && keyChars[0]) {
+                PostMessageW(m_hwnd, WM_CHAR, static_cast<WPARAM>(keyChars[0]), 1 << 30);
+            }
+            break;
+        case 3: // key up
+            PostMessageW(m_hwnd, WM_KEYUP, keyCode, (1 << 30) | (1 << 31));
+            break;
+        }
+    }
 
     void update(bool refreshBitmap, int devicePixelRatio) {
         if (refreshBitmap && !m_inRendering && m_webview) {
