@@ -14,6 +14,18 @@
 #include <dcomp.h>
 #include <WebView2.h>
 
+#include <d3d11.h>
+#include <dxgi.h>
+
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+
+#include <Windows.Graphics.Capture.Interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
+
 using Microsoft::WRL::ComPtr;
 using Microsoft::WRL::Callback;
 
@@ -70,6 +82,18 @@ static std::wstring GetUserDataPath() {
     return path;
 }
 
+static bool IsWGCSupported() {
+    typedef LONG(WINAPI* RtlGetVersionPtr)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (!ntdll) return false;
+    auto fn = reinterpret_cast<RtlGetVersionPtr>(GetProcAddress(ntdll, "RtlGetVersion"));
+    if (!fn) return false;
+    RTL_OSVERSIONINFOW vi = {};
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    fn(&vi);
+    return vi.dwBuildNumber >= 19041;
+}
+
 class WebViewInstance {
     std::thread m_thread;
     DWORD m_threadId = 0;
@@ -123,6 +147,17 @@ class WebViewInstance {
     std::atomic<bool> m_canGoBack{false};
     std::atomic<bool> m_canGoForward{false};
     std::atomic<int> m_progress{0};
+
+    // Windows Graphics Capture
+    std::atomic<bool> m_useWGC{false};
+    ComPtr<ID3D11Device> m_d3dDevice;
+    ComPtr<ID3D11DeviceContext> m_d3dContext;
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_winrtDevice{nullptr};
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool m_framePool{nullptr};
+    winrt::Windows::Graphics::Capture::GraphicsCaptureSession m_captureSession{nullptr};
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::FrameArrived_revoker m_frameArrivedRevoker;
+    ComPtr<ID3D11Texture2D> m_stagingTexture;
+    std::atomic<bool> m_wgcNeedsResize{false};
 
 public:
     WebViewInstance(const char* gameObject, bool transparent, bool zoom,
@@ -328,6 +363,7 @@ public:
     }
 
     void update(bool refreshBitmap, int devicePixelRatio) {
+        if (m_useWGC) return;
         if (refreshBitmap && !m_inRendering && m_webview) {
             m_inRendering = true;
             PostThreadMessageW(m_threadId, WM_WEBVIEW_CAPTURE, 0, 0);
@@ -497,6 +533,204 @@ private:
         converter->CopyPixels(nullptr, w * 4, static_cast<UINT>(buffer.size()), buffer.data());
     }
 
+    bool initD3D11Device() {
+        D3D_FEATURE_LEVEL featureLevels[] = { D3D_FEATURE_LEVEL_11_0 };
+        HRESULT hr = D3D11CreateDevice(
+            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            featureLevels, 1, D3D11_SDK_VERSION,
+            &m_d3dDevice, nullptr, &m_d3dContext);
+        if (FAILED(hr)) return false;
+
+        ComPtr<IDXGIDevice> dxgiDevice;
+        hr = m_d3dDevice.As(&dxgiDevice);
+        if (FAILED(hr)) return false;
+
+        winrt::com_ptr<::IInspectable> inspectable;
+        hr = CreateDirect3D11DeviceFromDXGIDevice(dxgiDevice.Get(), inspectable.put());
+        if (FAILED(hr)) return false;
+
+        m_winrtDevice = inspectable.as<winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice>();
+        return true;
+    }
+
+    bool initWGC() {
+        if (!IsWGCSupported()) return false;
+        if (!initD3D11Device()) return false;
+
+        try {
+            auto interopFactory = winrt::get_activation_factory<
+                winrt::Windows::Graphics::Capture::GraphicsCaptureItem,
+                IGraphicsCaptureItemInterop>();
+
+            winrt::Windows::Graphics::Capture::GraphicsCaptureItem item{nullptr};
+            HRESULT hr = interopFactory->CreateForWindow(
+                m_hwnd,
+                winrt::guid_of<winrt::Windows::Graphics::Capture::GraphicsCaptureItem>(),
+                winrt::put_abi(item));
+            if (FAILED(hr) || !item) {
+                teardownWGC();
+                return false;
+            }
+
+            auto size = item.Size();
+            m_framePool = winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool::CreateFreeThreaded(
+                m_winrtDevice,
+                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                2,
+                size);
+
+            m_frameArrivedRevoker = m_framePool.FrameArrived(
+                winrt::auto_revoke,
+                [this](auto& sender, auto&) { onFrameArrived(sender); });
+
+            m_captureSession = m_framePool.CreateCaptureSession(item);
+            m_captureSession.IsCursorCaptureEnabled(false);
+
+            // Disable yellow border on Windows 11+
+            if (auto session3 = m_captureSession.try_as<winrt::Windows::Graphics::Capture::IGraphicsCaptureSession3>()) {
+                session3.IsBorderRequired(false);
+            }
+
+            m_captureSession.StartCapture();
+            m_useWGC = true;
+            return true;
+        } catch (...) {
+            teardownWGC();
+            return false;
+        }
+    }
+
+    void onFrameArrived(winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool const& sender) {
+        if (m_inRendering.exchange(true)) return;
+
+        auto frame = sender.TryGetNextFrame();
+        if (!frame) {
+            m_inRendering.store(false);
+            return;
+        }
+
+        if (m_wgcNeedsResize.exchange(false)) {
+            auto size = frame.ContentSize();
+            sender.Recreate(
+                m_winrtDevice,
+                winrt::Windows::Graphics::DirectX::DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                2,
+                size);
+            m_inRendering.store(false);
+            return;
+        }
+
+        auto surface = frame.Surface();
+        auto access = surface.as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+        ComPtr<ID3D11Texture2D> frameTexture;
+        HRESULT hr = access->GetInterface(IID_PPV_ARGS(&frameTexture));
+        if (FAILED(hr)) {
+            m_inRendering.store(false);
+            return;
+        }
+
+        D3D11_TEXTURE2D_DESC desc;
+        frameTexture->GetDesc(&desc);
+        int w = static_cast<int>(desc.Width);
+        int h = static_cast<int>(desc.Height);
+        if (w <= 0 || h <= 0) {
+            m_inRendering.store(false);
+            return;
+        }
+
+        ensureStagingTexture(w, h);
+        if (!m_stagingTexture) {
+            m_inRendering.store(false);
+            return;
+        }
+
+        m_d3dContext->CopyResource(m_stagingTexture.Get(), frameTexture.Get());
+
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        hr = m_d3dContext->Map(m_stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+        if (FAILED(hr)) {
+            m_inRendering.store(false);
+            return;
+        }
+
+        int backBuffer;
+        {
+            std::lock_guard<std::mutex> lock(m_bitmapMutex);
+            backBuffer = 1 - m_currentBitmap;
+        }
+        size_t bufSize = static_cast<size_t>(w) * h * 4;
+        m_bitmaps[backBuffer].resize(bufSize);
+
+        // BGRA -> RGBA swizzle
+        uint8_t* dst = m_bitmaps[backBuffer].data();
+        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+        for (int row = 0; row < h; row++) {
+            const uint8_t* srcRow = src + row * mapped.RowPitch;
+            uint8_t* dstRow = dst + row * w * 4;
+            for (int col = 0; col < w; col++) {
+                dstRow[col * 4 + 0] = srcRow[col * 4 + 2]; // R <- B
+                dstRow[col * 4 + 1] = srcRow[col * 4 + 1]; // G
+                dstRow[col * 4 + 2] = srcRow[col * 4 + 0]; // B <- R
+                dstRow[col * 4 + 3] = srcRow[col * 4 + 3]; // A
+            }
+        }
+
+        m_d3dContext->Unmap(m_stagingTexture.Get(), 0);
+
+        {
+            std::lock_guard<std::mutex> lock(m_bitmapMutex);
+            m_bitmapWidth = w;
+            m_bitmapHeight = h;
+            m_currentBitmap = backBuffer;
+            m_needsDisplay = true;
+        }
+
+        m_inRendering.store(false);
+    }
+
+    void ensureStagingTexture(int width, int height) {
+        if (m_stagingTexture) {
+            D3D11_TEXTURE2D_DESC existing;
+            m_stagingTexture->GetDesc(&existing);
+            if (existing.Width == static_cast<UINT>(width) &&
+                existing.Height == static_cast<UINT>(height))
+                return;
+        }
+        m_stagingTexture = nullptr;
+        D3D11_TEXTURE2D_DESC desc = {};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        m_d3dDevice->CreateTexture2D(&desc, nullptr, &m_stagingTexture);
+    }
+
+    void teardownWGC() {
+        m_frameArrivedRevoker.revoke();
+        // Wait for any in-flight onFrameArrived to complete
+        while (m_inRendering.load()) {
+            std::this_thread::yield();
+        }
+        if (m_captureSession) {
+            m_captureSession.Close();
+            m_captureSession = nullptr;
+        }
+        if (m_framePool) {
+            m_framePool.Close();
+            m_framePool = nullptr;
+        }
+        m_stagingTexture = nullptr;
+        m_winrtDevice = nullptr;
+        m_d3dContext = nullptr;
+        m_d3dDevice = nullptr;
+        m_useWGC = false;
+    }
+
     void threadProc() {
         m_threadId = GetCurrentThreadId();
 
@@ -574,6 +808,7 @@ private:
             DispatchMessageW(&msg);
         }
 
+        teardownWGC();
         m_compositionController = nullptr;
         m_dcompVisual = nullptr;
         m_dcompTarget = nullptr;
@@ -643,6 +878,12 @@ private:
                 if (m_separated) {
                     SetWindowPos(m_hwnd, nullptr, 0, 0, m_width, m_height,
                                  SWP_NOMOVE | SWP_NOZORDER);
+                } else {
+                    SetWindowPos(m_hwnd, nullptr, 0, 0, m_width, m_height,
+                                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    if (m_useWGC) {
+                        m_wgcNeedsResize.store(true);
+                    }
                 }
             }
             break;
@@ -1025,6 +1266,10 @@ private:
         }
 
         m_initialized.store(true);
+
+        if (!m_separated) {
+            initWGC();
+        }
     }
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {

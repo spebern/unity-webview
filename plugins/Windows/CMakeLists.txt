@@ -21,7 +21,10 @@ target_link_libraries(WebViewPlugin PRIVATE
     shlwapi
     version
     windowscodecs
+    windowsapp
 )
+
+target_compile_options(WebViewPlugin PRIVATE /bigobj)
 
 target_compile_definitions(WebViewPlugin PRIVATE
     UNICODE
