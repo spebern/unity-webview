@@ -72,6 +72,7 @@ class WebViewInstance {
     ComPtr<ICoreWebView2CookieManager> m_cookieManager;
 
     HWND m_hwnd = nullptr;
+    HWND m_browserHwnd = nullptr;
 
     std::string m_gameObject;
     bool m_transparent = false;
@@ -225,50 +226,83 @@ public:
     bool canGoBack() { return m_canGoBack.load(); }
     bool canGoForward() { return m_canGoForward.load(); }
 
+    // Find the actual WebView2 browser child HWND for input forwarding
+    HWND getBrowserHwnd() {
+        if (!m_hwnd) return nullptr;
+        // WebView2 creates a child window hierarchy: our HWND > intermediate > Chrome_WidgetWin_0
+        // We need the deepest child that accepts input
+        HWND child = m_hwnd;
+        HWND next = nullptr;
+        while ((next = FindWindowExW(child, nullptr, nullptr, nullptr)) != nullptr) {
+            child = next;
+        }
+        return (child != m_hwnd) ? child : m_hwnd;
+    }
+
     void sendMouseEvent(int x, int y, float deltaY, int mouseState) {
         if (!m_hwnd || !m_controller) return;
+        HWND target = getBrowserHwnd();
         // Unity y-coordinate has origin at bottom-left; flip to top-left for Win32
         int wy = m_height - y;
         LPARAM lParam = MAKELPARAM(x, wy);
 
         switch (mouseState) {
         case 1: // mouse down
-            PostMessageW(m_hwnd, WM_LBUTTONDOWN, MK_LBUTTON, lParam);
+            PostMessageW(target, WM_LBUTTONDOWN, MK_LBUTTON, lParam);
             break;
         case 2: // mouse drag
-            PostMessageW(m_hwnd, WM_MOUSEMOVE, MK_LBUTTON, lParam);
+            PostMessageW(target, WM_MOUSEMOVE, MK_LBUTTON, lParam);
             break;
         case 3: // mouse up
-            PostMessageW(m_hwnd, WM_LBUTTONUP, 0, lParam);
+            PostMessageW(target, WM_LBUTTONUP, 0, lParam);
             break;
         default: // mouse move (no button)
-            PostMessageW(m_hwnd, WM_MOUSEMOVE, 0, lParam);
+            PostMessageW(target, WM_MOUSEMOVE, 0, lParam);
             break;
         }
         if (deltaY != 0.0f) {
-            PostMessageW(m_hwnd, WM_MOUSEWHEEL,
-                MAKEWPARAM(0, static_cast<short>(deltaY * WHEEL_DELTA)),
-                lParam);
+            // Use JavaScript scrolling with smooth behavior for offscreen WebView2
+            int scrollAmount = static_cast<int>(deltaY * -120);
+            char js[256];
+            snprintf(js, sizeof(js),
+                "window.scrollBy({top:%d,behavior:'smooth'})", scrollAmount);
+            auto* copy = _strdup(js);
+            PostThreadMessageW(m_threadId, WM_WEBVIEW_EVALUATEJS, 0, reinterpret_cast<LPARAM>(copy));
         }
     }
 
     void sendKeyEvent(int x, int y, char* keyChars, unsigned short keyCode, int keyState) {
         if (!m_hwnd) return;
+        HWND target = getBrowserHwnd();
+
+        // Map control character codes to virtual key codes for WM_KEYDOWN
+        UINT vk = 0;
+        switch (keyCode) {
+        case 0x08: vk = VK_BACK; break;
+        case 0x09: vk = VK_TAB; break;
+        case 0x0D: case 0x0A: vk = VK_RETURN; break;
+        case 0x1B: vk = VK_ESCAPE; break;
+        case 0x7F: vk = VK_DELETE; break;
+        }
+
         switch (keyState) {
         case 1: // key down
-            PostMessageW(m_hwnd, WM_KEYDOWN, keyCode, 0);
-            if (keyChars && keyChars[0]) {
-                PostMessageW(m_hwnd, WM_CHAR, static_cast<WPARAM>(keyChars[0]), 0);
-            }
-            break;
         case 2: // key repeat
-            PostMessageW(m_hwnd, WM_KEYDOWN, keyCode, 1 << 30);
-            if (keyChars && keyChars[0]) {
-                PostMessageW(m_hwnd, WM_CHAR, static_cast<WPARAM>(keyChars[0]), 1 << 30);
+        {
+            LPARAM lp = keyState == 2 ? (1 << 30) : 0;
+            if (vk) {
+                // Control key: send as WM_KEYDOWN with virtual key code
+                PostMessageW(target, WM_KEYDOWN, vk, lp);
+            } else if (keyChars && keyChars[0]) {
+                // Printable character: send as WM_CHAR only
+                PostMessageW(target, WM_CHAR, static_cast<WPARAM>(keyChars[0]), lp);
             }
             break;
+        }
         case 3: // key up
-            PostMessageW(m_hwnd, WM_KEYUP, keyCode, (1 << 30) | (1 << 31));
+            if (vk) {
+                PostMessageW(target, WM_KEYUP, vk, (1 << 30) | (1 << 31));
+            }
             break;
         }
     }
@@ -869,6 +903,16 @@ private:
                 self->m_controller->put_Bounds(rc);
             }
             return 0;
+        case WM_MOUSEWHEEL:
+        case WM_MOUSEHWHEEL:
+            // Forward scroll to WebView2's direct child window
+            if (self) {
+                HWND child = GetWindow(hwnd, GW_CHILD);
+                if (child) {
+                    return SendMessageW(child, msg, wParam, lParam);
+                }
+            }
+            break;
         case WM_DESTROY:
             return 0;
         }
