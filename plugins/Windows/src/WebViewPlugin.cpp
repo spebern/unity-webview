@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <shlwapi.h>
+#include <wincodec.h>
 #include <string>
 #include <queue>
 #include <mutex>
@@ -235,11 +236,31 @@ public:
     void sendMouseEvent(int x, int y, float deltaY, int mouseState) {}
     void sendKeyEvent(int x, int y, char* keyChars, unsigned short keyCode, int keyState) {}
 
-    // Stubs for Task 6
-    void update(bool refreshBitmap, int devicePixelRatio) {}
-    int bitmapWidth() { return 0; }
-    int bitmapHeight() { return 0; }
-    void render(void* textureBuffer) {}
+    void update(bool refreshBitmap, int devicePixelRatio) {
+        if (refreshBitmap && !m_inRendering && m_webview) {
+            m_inRendering = true;
+            PostThreadMessageW(m_threadId, WM_WEBVIEW_CAPTURE, 0, 0);
+        }
+    }
+
+    int bitmapWidth() {
+        std::lock_guard<std::mutex> lock(m_bitmapMutex);
+        return m_bitmapWidth;
+    }
+
+    int bitmapHeight() {
+        std::lock_guard<std::mutex> lock(m_bitmapMutex);
+        return m_bitmapHeight;
+    }
+
+    void render(void* textureBuffer) {
+        std::lock_guard<std::mutex> lock(m_bitmapMutex);
+        if (!m_needsDisplay) return;
+        if (m_bitmaps[m_currentBitmap].empty()) return;
+        m_needsDisplay = false;
+        memcpy(textureBuffer, m_bitmaps[m_currentBitmap].data(),
+               m_bitmapWidth * m_bitmapHeight * 4);
+    }
 
     // Stubs for Task 8
     void addCustomHeader(const char* key, const char* value) {
@@ -272,6 +293,40 @@ public:
     void getCookies(const char* url) {}
 
 private:
+    void decodePngFromStream(IStream* stream, std::vector<uint8_t>& buffer, int& width, int& height) {
+        ComPtr<IWICImagingFactory> factory;
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&factory));
+        if (FAILED(hr)) return;
+
+        ComPtr<IWICBitmapDecoder> decoder;
+        hr = factory->CreateDecoderFromStream(stream, nullptr,
+                                               WICDecodeMetadataCacheOnLoad, &decoder);
+        if (FAILED(hr)) return;
+
+        ComPtr<IWICBitmapFrameDecode> frame;
+        hr = decoder->GetFrame(0, &frame);
+        if (FAILED(hr)) return;
+
+        UINT w, h;
+        hr = frame->GetSize(&w, &h);
+        if (FAILED(hr)) return;
+
+        ComPtr<IWICFormatConverter> converter;
+        hr = factory->CreateFormatConverter(&converter);
+        if (FAILED(hr)) return;
+
+        hr = converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA,
+                                   WICBitmapDitherTypeNone, nullptr, 0.0,
+                                   WICBitmapPaletteTypeCustom);
+        if (FAILED(hr)) return;
+
+        width = static_cast<int>(w);
+        height = static_cast<int>(h);
+        buffer.resize(w * h * 4);
+        converter->CopyPixels(nullptr, w * 4, static_cast<UINT>(buffer.size()), buffer.data());
+    }
+
     void threadProc() {
         m_threadId = GetCurrentThreadId();
 
@@ -414,6 +469,39 @@ private:
                 }
             }
             break;
+        case WM_WEBVIEW_CAPTURE: {
+            if (!m_webview) {
+                m_inRendering = false;
+                break;
+            }
+            ComPtr<IStream> stream;
+            CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+            m_webview->CapturePreview(
+                COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG,
+                stream.Get(),
+                Callback<ICoreWebView2CapturePreviewCompletedHandler>(
+                    [this, stream](HRESULT errorCode) -> HRESULT {
+                        if (SUCCEEDED(errorCode)) {
+                            LARGE_INTEGER li = {};
+                            stream->Seek(li, STREAM_SEEK_SET, nullptr);
+
+                            int newBitmap = 1 - m_currentBitmap;
+                            int w = 0, h = 0;
+                            decodePngFromStream(stream.Get(), m_bitmaps[newBitmap], w, h);
+
+                            if (w > 0 && h > 0) {
+                                std::lock_guard<std::mutex> lock(m_bitmapMutex);
+                                m_bitmapWidth = w;
+                                m_bitmapHeight = h;
+                                m_currentBitmap = newBitmap;
+                                m_needsDisplay = true;
+                            }
+                        }
+                        m_inRendering = false;
+                        return S_OK;
+                    }).Get());
+            break;
+        }
         }
     }
 

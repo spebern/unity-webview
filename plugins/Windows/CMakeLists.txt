@@ -20,6 +20,7 @@ target_link_libraries(WebViewPlugin PRIVATE
     dcomp
     shlwapi
     version
+    windowscodecs
 )
 
 target_compile_definitions(WebViewPlugin PRIVATE
